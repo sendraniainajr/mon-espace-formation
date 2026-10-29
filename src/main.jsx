@@ -32,6 +32,7 @@ import {
 } from "./tickets.js";
 import { buildWeeklyTasks } from "./planning.js";
 import { SUPPORT_LABS, getSupportLabSummary } from "./support.js";
+import { getAdminAccessState } from "./adminAccess.js";
 import "./style.css";
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
@@ -174,9 +175,17 @@ const initialTasks = buildWeeklyTasks(plan);
 function App() {
   const [session, setSession] = useState(null);
   const [authReady, setAuthReady] = useState(!supabase);
+  const [adminReady, setAdminReady] = useState(!supabase);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const accessState = getAdminAccessState({
+    supabaseConfigured: Boolean(supabase),
+    isDevelopment: import.meta.env.DEV,
+    hasSession: Boolean(session),
+    adminVerified: adminReady && isAdmin,
+  });
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [authMode, setAuthMode] = useState("login");
+  const [resetMode, setResetMode] = useState(false);
   const [authMessage, setAuthMessage] = useState("");
   const [view, setView] = useState("dashboard");
   const [selectedDay, setSelectedDay] = useState(todayName);
@@ -229,7 +238,7 @@ function App() {
 
     async function loadTickets() {
       try {
-        if (supabase && session) {
+        if (supabase && session && isAdmin) {
           const { data, error } = await supabase
             .from("tickets")
             .select("*")
@@ -238,6 +247,7 @@ function App() {
           if (alive) setTickets((data || []).map(normalizeTicket));
           return;
         }
+        if (supabase || !import.meta.env.DEV) return;
 
         const remoteTickets = await fetchTicketsFromApi();
         if (!alive || remoteTickets.length === 0) return;
@@ -257,7 +267,7 @@ function App() {
     return () => {
       alive = false;
     };
-  }, [session?.user?.id]);
+  }, [session?.user?.id, isAdmin]);
   const [ticketForm, setTicketForm] = useState({
     title: "",
     description: "",
@@ -283,8 +293,14 @@ function App() {
 
   useEffect(() => {
     if (!supabase) return;
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
+    const recoveryLink = new URLSearchParams(window.location.hash.slice(1)).get("type") === "recovery";
+    if (recoveryLink) setResetMode(true);
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (error) setAuthMessage("Impossible de vérifier la session. Réessaie.");
+      setSession(data?.session ?? null);
+      setAuthReady(true);
+    }).catch(() => {
+      setAuthMessage("Service d’authentification indisponible. Réessaie plus tard.");
       setAuthReady(true);
     });
     const {
@@ -292,6 +308,60 @@ function App() {
     } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
     return () => subscription.unsubscribe();
   }, []);
+
+  useEffect(() => {
+    if (!supabase) {
+      setIsAdmin(import.meta.env.DEV);
+      setAdminReady(true);
+      return;
+    }
+    if (!session) {
+      setIsAdmin(false);
+      setAdminReady(true);
+      return;
+    }
+
+    let active = true;
+    setIsAdmin(false);
+    setAdminReady(false);
+    const timer = setTimeout(() => {
+      void verifyAdminAccess();
+    }, 0);
+
+    async function verifyAdminAccess() {
+      try {
+      const { data, error } = await supabase
+        .from("admin_users")
+        .select("user_id")
+        .eq("user_id", session.user.id)
+        .maybeSingle();
+      if (!active) return;
+
+      if (error || !data) {
+        setIsAdmin(false);
+        setAuthMessage("Accès refusé : ce compte n’est pas autorisé à accéder à cet espace.");
+        if (active) setAdminReady(true);
+        await supabase.auth.signOut();
+        return;
+      }
+
+      setIsAdmin(true);
+      setAuthMessage("");
+      setAdminReady(true);
+      } catch {
+        if (!active) return;
+        setIsAdmin(false);
+        setAuthMessage("Autorisation impossible à vérifier. Accès bloqué par sécurité.");
+        setAdminReady(true);
+        await supabase.auth.signOut();
+      }
+    }
+
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [session?.user?.id]);
 
   useEffect(() => {
     const snapshot = {
@@ -322,7 +392,7 @@ function App() {
   }, [tickets]);
 
   useEffect(() => {
-    if (!session || !supabase) {
+    if (!session || !supabase || !isAdmin) {
       setSyncState("local");
       return;
     }
@@ -359,10 +429,10 @@ function App() {
     return () => {
       active = false;
     };
-  }, [session?.user?.id]);
+  }, [session?.user?.id, isAdmin]);
 
   useEffect(() => {
-    if (!session || !supabase || syncState !== "synced") return;
+    if (!session || !supabase || !isAdmin || syncState !== "synced") return;
     const timer = setTimeout(async () => {
       setSyncState("syncing");
       const payload = { completed, topicDone, cases, review };
@@ -379,7 +449,7 @@ function App() {
       setSyncState(error ? "error" : "synced");
     }, 700);
     return () => clearTimeout(timer);
-  }, [completed, topicDone, cases, review, session?.user?.id]);
+  }, [completed, topicDone, cases, review, session?.user?.id, isAdmin]);
 
   const allCount = initialTasks.filter((task) => task.isWorkSession).length;
   const completedCount = initialTasks.filter(
@@ -406,24 +476,14 @@ function App() {
       return;
     }
 
-    const result =
-      authMode === "login"
-        ? await supabase.auth.signInWithPassword({ email, password })
-        : await supabase.auth.signUp({
-            email,
-            password,
-            options: {
-              emailRedirectTo: `${window.location.origin}${import.meta.env.BASE_URL}`,
-            },
-          });
-
-    setAuthMessage(
-      result.error?.message ||
-        (authMode === "signup"
-          ? "Compte créé. Vérifie ton e-mail si une confirmation est demandée."
-          : "Connexion réussie."),
-    );
-    setBusy(false);
+    try {
+      const { error } = await supabase.auth.signInWithPassword({ email, password });
+      setAuthMessage(error?.message || "Connexion vérifiée. Contrôle de l’autorisation en cours…");
+    } catch {
+      setAuthMessage("Connexion impossible. Vérifie les informations saisies et réessaie.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function handlePasswordReset() {
@@ -448,9 +508,30 @@ function App() {
     );
   }
 
+  async function handlePasswordUpdate(e) {
+    e.preventDefault();
+    if (!supabase || password.length < 8) {
+      setAuthMessage("Choisis un mot de passe d’au moins 8 caractères.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const { error } = await supabase.auth.updateUser({ password });
+      setAuthMessage(error?.message || "Mot de passe mis à jour.");
+      if (!error) setResetMode(false);
+    } catch {
+      setAuthMessage("Mise à jour impossible. Demande un nouveau lien de réinitialisation.");
+    } finally {
+      setPassword("");
+      setBusy(false);
+    }
+  }
+
   async function logout() {
     await supabase?.auth.signOut();
     setSession(null);
+    setAdminReady(true);
+    setIsAdmin(false);
   }
   function toggleTask(id) {
     setCompleted((old) => ({ ...old, [id]: !old[id] }));
@@ -502,6 +583,8 @@ function App() {
         const { data, error } = await query.select().single();
         if (error) throw error;
         ticketFromApi = normalizeTicket(data);
+      } else if (supabase || !import.meta.env.DEV) {
+        throw new Error("Accès distant non autorisé");
       } else {
         if (!API_BASE_URL) throw new Error("API distante non configurée");
         const url = editingTicketId
@@ -531,6 +614,10 @@ function App() {
         setTicketMessage("Ticket ajouté avec succès via l’API.");
       }
     } catch {
+      if (supabase || !import.meta.env.DEV) {
+        setTicketMessage("Échec de l’enregistrement sécurisé. Aucune modification locale n’a été effectuée.");
+        return;
+      }
       if (editingTicketId) {
         setTickets((old) =>
           old.map((ticket) =>
@@ -572,6 +659,8 @@ function App() {
           .single();
         if (error) throw error;
         closedTicket = normalizeTicket(data);
+      } else if (supabase || !import.meta.env.DEV) {
+        throw new Error("Accès distant non autorisé");
       } else {
         if (!API_BASE_URL) throw new Error("API distante non configurée");
         const response = await fetch(`${API_BASE_URL}/tickets/${ticketId}/close`, {
@@ -590,6 +679,10 @@ function App() {
       setTicketMessage("Ticket clôturé avec succès.");
       return;
     } catch {
+      if (supabase || !import.meta.env.DEV) {
+        setTicketMessage("Impossible de clôturer le ticket dans le stockage sécurisé.");
+        return;
+      }
       setTickets((old) =>
         old.map((ticket) =>
           ticket.id === ticketId ? { ...ticket, status: "Fermé" } : ticket,
@@ -604,6 +697,8 @@ function App() {
       if (supabase && session) {
         const { error } = await supabase.from("tickets").delete().eq("id", ticketId);
         if (error) throw error;
+      } else if (supabase || !import.meta.env.DEV) {
+        throw new Error("Accès distant non autorisé");
       } else {
         if (!API_BASE_URL) throw new Error("API distante non configurée");
         const response = await fetch(`${API_BASE_URL}/tickets/${ticketId}`, {
@@ -619,6 +714,10 @@ function App() {
       }
       return;
     } catch {
+      if (supabase || !import.meta.env.DEV) {
+        setTicketMessage("Impossible de supprimer le ticket dans le stockage sécurisé.");
+        return;
+      }
       setTickets((old) => old.filter((ticket) => ticket.id !== ticketId));
       setTicketMessage("Ticket supprimé localement. L’API n’est pas disponible.");
       if (editingTicketId === ticketId) {
@@ -641,6 +740,23 @@ function App() {
 
   async function exportTickets() {
     try {
+      if (supabase && session && isAdmin) {
+        const { data, error } = await supabase
+          .from("tickets")
+          .select("id,title,description,priority,status,category,created_at")
+          .order("created_at", { ascending: false });
+        if (error) throw error;
+        const csv = exportTicketsCsv((data || []).map(normalizeTicket));
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "tickets.csv";
+        link.click();
+        URL.revokeObjectURL(url);
+        return;
+      }
+      if (supabase || !import.meta.env.DEV) throw new Error("Accès distant non autorisé");
       if (!API_BASE_URL) throw new Error("API distante non configurée");
 
       const response = await fetch(`${API_BASE_URL}/tickets/export.csv`);
@@ -658,6 +774,10 @@ function App() {
       URL.revokeObjectURL(url);
       return;
     } catch {
+      if (supabase || !import.meta.env.DEV) {
+        setTicketMessage("Export impossible : vérifie la connexion sécurisée.");
+        return;
+      }
       const csv = exportTicketsCsv(tickets);
       const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
       const url = URL.createObjectURL(blob);
@@ -684,19 +804,32 @@ function App() {
   ];
   if (!authReady)
     return <div className="loading">Préparation de ton espace…</div>;
-  if (supabase && !session)
+  if (accessState === "configuration-required")
+    return (
+      <div className="auth-page">
+        <div className="auth-card">
+          <div className="brand-mark"><ShieldCheck size={28} /></div>
+          <p className="eyebrow">ACCÈS SÉCURISÉ</p>
+          <h1>Accès temporairement fermé</h1>
+          <p className="muted">L’authentification n’est pas encore configurée. L’accès au site est bloqué jusqu’à l’activation de Supabase.</p>
+        </div>
+      </div>
+    );
+  if (["login-required", "verification-pending"].includes(accessState))
     return (
       <div className="auth-page">
         <div className="auth-card">
           <div className="brand-mark">
-            <GraduationCap size={28} />
+            <ShieldCheck size={28} />
           </div>
-          <p className="eyebrow">MON ESPACE FORMATION</p>
-          <h1>{authMode === "login" ? "Bon retour !" : "Créer mon compte"}</h1>
+          <p className="eyebrow">ESPACE ADMINISTRATEUR</p>
+          <h1>{session ? "Vérification de l’accès" : "Connexion sécurisée"}</h1>
           <p className="muted">
-            Suis tes progrès Python et Support N2/N3, depuis tes appareils.
+            {session && !adminReady
+              ? "Vérification de ton autorisation…"
+              : "Accès réservé aux comptes ajoutés à la liste des administrateurs."}
           </p>
-          <form onSubmit={handleAuth}>
+          {!session && <form onSubmit={handleAuth}>
             <label>
               Adresse e-mail
               <input
@@ -719,34 +852,46 @@ function App() {
               />
             </label>
             <button className="primary full" disabled={busy}>
-              {busy
-                ? "Patiente…"
-                : authMode === "login"
-                  ? "Se connecter"
-                  : "Créer mon compte"}
+              {busy ? "Patiente…" : "Se connecter"}
             </button>
-          </form>
-          {authMode === "login" && (
+          </form>}
+          {!session && (
             <button className="link-button" onClick={handlePasswordReset}>
               Mot de passe oublié ?
             </button>
           )}
           {authMessage && <p className="notice">{authMessage}</p>}
-          <button
-            className="link-button"
-            onClick={() => {
-              setAuthMode(authMode === "login" ? "signup" : "login");
-              setAuthMessage("");
-            }}
-          >
-            {authMode === "login"
-              ? "Pas encore de compte ? Créer un compte"
-              : "Déjà un compte ? Se connecter"}
-          </button>
+          {session && <button className="link-button" onClick={logout}>Se déconnecter</button>}
           <p className="tiny muted">
-            Tes données sont associées à ton compte lorsque la synchronisation
-            est configurée.
+            Aucun compte ne peut s’inscrire depuis cette page. L’administrateur doit autoriser les comptes depuis Supabase.
           </p>
+        </div>
+      </div>
+    );
+  if (accessState === "granted" && resetMode)
+    return (
+      <div className="auth-page">
+        <div className="auth-card">
+          <div className="brand-mark"><ShieldCheck size={28} /></div>
+          <p className="eyebrow">ESPACE ADMINISTRATEUR</p>
+          <h1>Nouveau mot de passe</h1>
+          <form onSubmit={handlePasswordUpdate}>
+            <label>
+              Mot de passe (8 caractères minimum)
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                minLength="8"
+                autoComplete="new-password"
+                required
+              />
+            </label>
+            <button className="primary full" disabled={busy}>
+              {busy ? "Patiente…" : "Enregistrer le mot de passe"}
+            </button>
+          </form>
+          {authMessage && <p className="notice">{authMessage}</p>}
         </div>
       </div>
     );
@@ -791,7 +936,7 @@ function App() {
               <span>Un petit pas chaque jour.</span>
             </div>
           </div>
-          {session && (
+          {session && isAdmin && (
             <button className="nav-item" onClick={logout}>
               <LogOut size={18} />
               Se déconnecter

@@ -11,7 +11,7 @@ Application web pédagogique en français pour suivre Python et le support infor
 - Cahier de cas : symptôme, cause et solution.
 - Bilan hebdomadaire.
 - Sauvegarde locale automatique.
-- Inscription/connexion e-mail et synchronisation cloud via Supabase (après configuration).
+- Connexion réservée aux comptes explicitement autorisés dans Supabase.
 
 ## 1. Prérequis
 
@@ -32,9 +32,19 @@ Sous Windows PowerShell, si `cp` ne fonctionne pas :
 Copy-Item .env.example .env
 ```
 
-## 3. Configurer la base de données
+## 3. Configurer la base de données et l’administrateur
 
-Dans Supabase, ouvre **SQL Editor**, colle le contenu de `supabase/schema.sql`, puis exécute-le.
+Dans Supabase, ouvre **SQL Editor**, colle le contenu de `supabase/schema.sql`, puis exécute-le. Le script crée la liste d’autorisation des administrateurs et réserve les données de l’application aux comptes qui s’y trouvent.
+
+Dans **Authentication > Users**, crée l’utilisateur administrateur avec une adresse e-mail et un mot de passe fort. Ensuite, dans le SQL Editor, ajoute son adresse à la liste blanche en remplaçant l’adresse d’exemple :
+
+```sql
+insert into public.admin_users (user_id)
+select id from auth.users where email = 'ADMIN@EXEMPLE.COM'
+on conflict (user_id) do nothing;
+```
+
+Désactive ensuite l’inscription publique dans **Authentication > Settings > User Signups**. Pour autoriser quelqu’un plus tard, crée d’abord son compte dans le tableau de bord Supabase, puis ajoute son adresse à `admin_users` de la même façon. Pour révoquer un accès, supprime sa ligne de `admin_users`.
 
 Dans les paramètres du projet Supabase, récupère l'URL du projet et la clé publique **anon/publishable**. Place-les dans `.env` :
 
@@ -45,7 +55,7 @@ VITE_SUPABASE_ANON_KEY=VOTRE_CLE_PUBLIQUE
 
 Ne mets jamais une clé `service_role` dans une application web.
 
-Dans Supabase Authentication, configure les options de confirmation d'e-mail et les URL autorisées selon ton environnement. Pour tester en local, l'URL est généralement `http://localhost:5173`.
+Dans Supabase Authentication, configure les URL autorisées. Ajoute l’URL GitHub Pages ci-dessous à **Site URL** et **Redirect URLs**. Le formulaire de l’application accepte uniquement une connexion : la création de comptes se fait dans le tableau de bord Supabase par l’administrateur.
 
 ## 4. Démarrer en local
 
@@ -65,7 +75,7 @@ npm run build
 
 Sans configuration Supabase, l'application fonctionne en mode local sur le navigateur et affiche **Mode local**. Les données ne sont pas synchronisées entre appareils.
 
-Après configuration, crée un compte et connecte-toi. Les tâches, notions, cas et bilan sont synchronisés dans `study_progress`. La politique RLS limite l'accès à la ligne de l'utilisateur connecté.
+Après configuration, connecte-toi avec le compte administrateur autorisé. Les tâches, notions, cas, tickets et bilan sont synchronisés via Supabase. Les politiques RLS refusent l’accès aux données aux comptes qui ne figurent pas dans `admin_users`.
 
 ## 6. Mettre l'application en ligne sur GitHub Pages
 
@@ -76,9 +86,9 @@ Le dépôt contient un workflow GitHub Actions qui lance les tests, construit l'
 3. Dans **Settings > Pages**, sélectionne **GitHub Actions** comme source de publication.
 4. Attends que l’action **Deploy to GitHub Pages** se termine. L'adresse affichée dans l'environnement `github-pages` sera accessible depuis ton téléphone.
 5. Dans Supabase **Authentication > URL Configuration**, ajoute cette adresse aux **Site URL** et **Redirect URLs**. Exécute aussi `supabase/schema.sql` dans le SQL Editor si ce n'est pas déjà fait.
-6. Ouvre l'adresse sur le téléphone et crée un compte. La progression et les tickets seront alors synchronisés entre appareils.
+6. Ouvre l'adresse sur le téléphone et connecte-toi avec l’adresse e-mail du compte administrateur créé dans Supabase. La progression et les tickets seront alors synchronisés entre appareils. Les identifiants doivent être créés et réinitialisés dans Supabase, jamais inscrits dans le code ou dans GitHub.
 
-Sans variables Supabase, la page reste consultable, mais les données ne sont sauvegardées que dans le navigateur de chaque appareil. L'API Python locale n'est pas hébergée par GitHub Pages ; les tickets utilisent Supabase lorsqu'un compte est configuré, sinon le mode local.
+En production, si Supabase n’est pas configuré, l’application reste fermée par sécurité. GitHub Pages sert des fichiers statiques : l’URL et les fichiers du site restent publiquement accessibles, mais l’interface et les données de l’application sont protégées par connexion, liste d’administrateurs et politiques RLS. Pour rendre le site lui-même privé, il faut un hébergement avec contrôle d’accès privé (GitHub Pages ne fournit pas cette restriction sur un compte standard). L’API Python locale n’est pas hébergée par GitHub Pages.
 
 ## Structure du projet
 
