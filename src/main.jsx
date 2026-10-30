@@ -5,6 +5,8 @@ import {
   BookOpen,
   CalendarDays,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   CircleHelp,
   Clock3,
   Code2,
@@ -33,6 +35,15 @@ import {
 import { buildWeeklyTasks } from "./planning.js";
 import { SUPPORT_LABS, getSupportLabSummary } from "./support.js";
 import { getAdminAccessState } from "./adminAccess.js";
+import {
+  AGENDA_CATEGORIES,
+  EMPTY_AGENDA_EVENT,
+  getMonthGrid,
+  getAgendaWeekdayLabels,
+  normalizeAgendaEvent,
+  sortAgendaEvents,
+  toDateKey,
+} from "./agenda.js";
 import "./style.css";
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
@@ -57,6 +68,7 @@ const mergeProgressData = (remote = {}, local = {}) => ({
   topicDone: { ...(local.topicDone || {}), ...(remote.topicDone || {}) },
   cases: Array.isArray(remote.cases) && remote.cases.length > 0 ? remote.cases : local.cases || [],
   review: remote.review && Object.keys(remote.review).length > 0 ? remote.review : local.review || DEFAULT_REVIEW,
+  agenda: Array.isArray(remote.agenda) ? remote.agenda : local.agenda || [],
 });
 
 const plan = [
@@ -189,6 +201,18 @@ function App() {
   const [authMessage, setAuthMessage] = useState("");
   const [view, setView] = useState("dashboard");
   const [selectedDay, setSelectedDay] = useState(todayName);
+  const [agendaEvents, setAgendaEvents] = useState(() =>
+    readFromStorage("study-agenda", []),
+  );
+  const [agendaHydrated, setAgendaHydrated] = useState(false);
+  const [agendaForm, setAgendaForm] = useState(EMPTY_AGENDA_EVENT);
+  const [editingAgendaEventId, setEditingAgendaEventId] = useState(null);
+  const [agendaMessage, setAgendaMessage] = useState("");
+  const [agendaMonth, setAgendaMonth] = useState(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), 1);
+  });
+  const [selectedAgendaDate, setSelectedAgendaDate] = useState(() => dateKey());
   const [completed, setCompleted] = useState({});
   const [topicDone, setTopicDone] = useState({});
   const [cases, setCases] = useState([]);
@@ -369,11 +393,14 @@ function App() {
       topicDone: readFromStorage("study-topics", {}),
       cases: readFromStorage("study-cases", []),
       review: readFromStorage("study-review", DEFAULT_REVIEW),
+      agenda: readFromStorage("study-agenda", []),
     };
     setCompleted(snapshot.completed);
     setTopicDone(snapshot.topicDone);
     setCases(snapshot.cases);
     setReview(snapshot.review);
+    setAgendaEvents(snapshot.agenda);
+    setAgendaHydrated(true);
   }, []);
   useEffect(() => {
     localStorage.setItem("study-completed", JSON.stringify(completed));
@@ -390,13 +417,18 @@ function App() {
   useEffect(() => {
     localStorage.setItem("study-tickets", JSON.stringify(tickets));
   }, [tickets]);
+  useEffect(() => {
+    localStorage.setItem("study-agenda", JSON.stringify(agendaEvents));
+  }, [agendaEvents]);
 
   useEffect(() => {
     if (!session || !supabase || !isAdmin) {
+      setAgendaHydrated(!supabase);
       setSyncState("local");
       return;
     }
     let active = true;
+    setAgendaHydrated(false);
     (async () => {
       setSyncState("syncing");
       const localSnapshot = {
@@ -404,6 +436,7 @@ function App() {
         topicDone: readFromStorage("study-topics", {}),
         cases: readFromStorage("study-cases", []),
         review: readFromStorage("study-review", DEFAULT_REVIEW),
+        agenda: readFromStorage("study-agenda", []),
       };
 
       const { data, error } = await supabase
@@ -424,6 +457,8 @@ function App() {
       setTopicDone(nextState.topicDone);
       setCases(nextState.cases);
       setReview(nextState.review);
+      setAgendaEvents(nextState.agenda);
+      setAgendaHydrated(true);
       setSyncState("synced");
     })();
     return () => {
@@ -432,10 +467,10 @@ function App() {
   }, [session?.user?.id, isAdmin]);
 
   useEffect(() => {
-    if (!session || !supabase || !isAdmin || syncState !== "synced") return;
+    if (!session || !supabase || !isAdmin || syncState !== "synced" || !agendaHydrated) return;
     const timer = setTimeout(async () => {
       setSyncState("syncing");
-      const payload = { completed, topicDone, cases, review };
+      const payload = { completed, topicDone, cases, review, agenda: agendaEvents };
       const { error } = await supabase
         .from("study_progress")
         .upsert(
@@ -449,7 +484,7 @@ function App() {
       setSyncState(error ? "error" : "synced");
     }, 700);
     return () => clearTimeout(timer);
-  }, [completed, topicDone, cases, review, session?.user?.id, isAdmin]);
+  }, [completed, topicDone, cases, review, agendaEvents, session?.user?.id, isAdmin, agendaHydrated]);
 
   const allCount = initialTasks.filter((task) => task.isWorkSession).length;
   const completedCount = initialTasks.filter(
@@ -797,6 +832,7 @@ function App() {
   const nav = [
     ["dashboard", "Tableau de bord", LayoutDashboard],
     ["planning", "Mon planning", CalendarDays],
+    ["agenda", "Agenda", CalendarDays],
     ["python", "Parcours Python", Code2],
     ["support", "Support N2/N3", Server],
     ["cases", "Cahier de cas", Wrench],
@@ -1190,6 +1226,54 @@ function App() {
                 simplement deux jours d'arrêt consécutifs.
               </p>
             </>
+          )}
+          {view === "agenda" && (
+            <AgendaView
+              events={agendaEvents}
+              month={agendaMonth}
+              selectedDate={selectedAgendaDate}
+              form={agendaForm}
+              editingId={editingAgendaEventId}
+              message={agendaMessage}
+              onMonthChange={setAgendaMonth}
+              onSelectDate={setSelectedAgendaDate}
+              onFormChange={setAgendaForm}
+              onMessage={setAgendaMessage}
+              onEdit={(event) => {
+                setAgendaForm({ ...event });
+                setEditingAgendaEventId(event.id);
+                setAgendaMessage("");
+              }}
+              onCancelEdit={() => {
+                setAgendaForm({ ...EMPTY_AGENDA_EVENT, date: selectedAgendaDate });
+                setEditingAgendaEventId(null);
+                setAgendaMessage("");
+              }}
+              onSave={(event) => {
+                const normalized = normalizeAgendaEvent(event);
+                setAgendaEvents((current) => {
+                  const next = editingAgendaEventId
+                    ? current.map((item) => item.id === editingAgendaEventId ? { ...normalized, id: editingAgendaEventId } : item)
+                    : [...current, normalized];
+                  return sortAgendaEvents(next);
+                });
+                setSelectedAgendaDate(normalized.date);
+                setAgendaForm({ ...EMPTY_AGENDA_EVENT, date: normalized.date });
+                setEditingAgendaEventId(null);
+                setAgendaMessage(editingAgendaEventId ? "Événement modifié." : "Événement ajouté à l’agenda.");
+              }}
+              onToggle={(eventId) => setAgendaEvents((current) =>
+                sortAgendaEvents(current.map((item) => item.id === eventId ? { ...item, completed: !item.completed } : item)),
+              )}
+              onDelete={(eventId) => {
+                setAgendaEvents((current) => current.filter((item) => item.id !== eventId));
+                if (editingAgendaEventId === eventId) {
+                  setAgendaForm({ ...EMPTY_AGENDA_EVENT, date: selectedAgendaDate });
+                  setEditingAgendaEventId(null);
+                }
+                setAgendaMessage("Événement supprimé.");
+              }}
+            />
           )}
           {view === "python" && (
             <>
@@ -1773,6 +1857,202 @@ function App() {
         </div>
       </main>
     </div>
+  );
+}
+function AgendaView({
+  events,
+  month,
+  selectedDate,
+  form,
+  editingId,
+  message,
+  onMonthChange,
+  onSelectDate,
+  onFormChange,
+  onMessage,
+  onEdit,
+  onCancelEdit,
+  onSave,
+  onToggle,
+  onDelete,
+}) {
+  const monthGrid = getMonthGrid(month);
+  const monthLabel = new Intl.DateTimeFormat("fr-FR", {
+    month: "long",
+    year: "numeric",
+  }).format(month);
+  const selectedEvents = sortAgendaEvents(events).filter(
+    (event) => event.date === selectedDate,
+  );
+  const monthEventCount = events.filter((event) =>
+    event.date.startsWith(`${month.getFullYear()}-${String(month.getMonth() + 1).padStart(2, "0")}`),
+  ).length;
+
+  function changeMonth(offset) {
+    const nextMonth = new Date(month.getFullYear(), month.getMonth() + offset, 1);
+    onMonthChange(nextMonth);
+    onSelectDate(toDateKey(nextMonth));
+    onFormChange({ ...form, date: toDateKey(nextMonth) });
+  }
+
+  function submitEvent(event) {
+    event.preventDefault();
+    if (!String(form.title || "").trim()) {
+      onMessage("Indique un titre pour l’événement.");
+      return;
+    }
+    if (!form.date) {
+      onMessage("Choisis une date pour l’événement.");
+      return;
+    }
+    onSave({ ...form, date: form.date || selectedDate });
+  }
+
+  return (
+    <>
+      <PageTitle
+        eyebrow="ORGANISATION PERSONNELLE"
+        title="Mon agenda"
+        description="Visualise tes événements du mois et marque chaque rendez-vous comme terminé."
+      />
+      <div className="agenda-layout">
+        <section className="panel agenda-calendar-panel">
+          <div className="panel-heading agenda-month-heading">
+            <div>
+              <h2>Vue globale</h2>
+              <p className="muted">{monthEventCount} événement{monthEventCount === 1 ? "" : "s"} ce mois-ci</p>
+            </div>
+            <div className="agenda-month-controls">
+              <button className="secondary agenda-icon-button" type="button" aria-label="Mois précédent" onClick={() => changeMonth(-1)}>
+                <ChevronLeft size={17} />
+              </button>
+              <strong className="agenda-month-label">{monthLabel}</strong>
+              <button className="secondary agenda-icon-button" type="button" aria-label="Mois suivant" onClick={() => changeMonth(1)}>
+                <ChevronRight size={17} />
+              </button>
+              <button className="text-button" type="button" onClick={() => {
+                const today = new Date();
+                onMonthChange(new Date(today.getFullYear(), today.getMonth(), 1));
+                onSelectDate(toDateKey(today));
+                onFormChange({ ...form, date: toDateKey(today) });
+              }}>Aujourd’hui</button>
+            </div>
+          </div>
+          <div className="agenda-calendar" role="grid" aria-label={`Calendrier ${monthLabel}`}>
+            {getAgendaWeekdayLabels().map((day, index) => (
+              <div className="agenda-weekday" role="columnheader" key={`${day}-${index}`}>{day}</div>
+            ))}
+            {monthGrid.map((date) => {
+              const key = toDateKey(date);
+              const dayEvents = events.filter((event) => event.date === key);
+              const isCurrentMonth = date.getMonth() === month.getMonth();
+              return (
+                <button
+                  className={`agenda-day ${isCurrentMonth ? "" : "outside-month"} ${key === selectedDate ? "selected" : ""} ${key === toDateKey(new Date()) ? "today" : ""}`}
+                  type="button"
+                  role="gridcell"
+                  aria-label={`${date.toLocaleDateString("fr-FR", { dateStyle: "full" })}${dayEvents.length ? `, ${dayEvents.length} événement(s)` : ""}`}
+                  aria-pressed={key === selectedDate}
+                  key={key}
+                  onClick={() => {
+                    onSelectDate(key);
+                    onFormChange({ ...form, date: key });
+                  }}
+                >
+                  <span className="agenda-day-number">{date.getDate()}</span>
+                  {dayEvents.length > 0 && (
+                    <span className="agenda-day-events" aria-hidden="true">
+                      {dayEvents.slice(0, 3).map((item) => (
+                        <i key={item.id} className={`agenda-dot agenda-dot-${item.category.toLowerCase().replace(/[^a-z]+/g, "-")}`} />
+                      ))}
+                      {dayEvents.length > 3 && <small>+{dayEvents.length - 3}</small>}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          <div className="agenda-legend">
+            {AGENDA_CATEGORIES.map((category) => (
+              <span key={category}><i className={`agenda-dot agenda-dot-${category.toLowerCase().replace(/[^a-z]+/g, "-")}`} />{category}</span>
+            ))}
+          </div>
+        </section>
+
+        <section className="panel agenda-day-panel">
+          <div className="panel-heading">
+            <div>
+              <h2>{new Date(`${selectedDate}T12:00:00`).toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })}</h2>
+              <p className="muted">{selectedEvents.length ? `${selectedEvents.length} événement${selectedEvents.length === 1 ? "" : "s"}` : "Aucun événement prévu"}</p>
+            </div>
+            <span className="month-tag">{selectedEvents.filter((item) => item.completed).length}/{selectedEvents.length} terminés</span>
+          </div>
+          {selectedEvents.length === 0 ? (
+            <div className="agenda-empty"><CalendarDays size={23} /><span>Cette journée est libre. Ajoute un événement ci-dessous.</span></div>
+          ) : (
+            <div className="agenda-event-list">
+              {selectedEvents.map((event) => (
+                <article className={`agenda-event ${event.completed ? "agenda-event-done" : ""}`} key={event.id}>
+                  <button
+                    type="button"
+                    className="agenda-event-check"
+                    aria-label={event.completed ? "Marquer comme à faire" : "Marquer comme terminé"}
+                    aria-pressed={event.completed}
+                    onClick={() => onToggle(event.id)}
+                  >{event.completed ? <CheckCircle2 size={20} /> : <span />}</button>
+                  <div className="agenda-event-content">
+                    <div className="agenda-event-title-row">
+                      <strong>{event.title}</strong>
+                      <span className="agenda-event-time">{event.time}</span>
+                    </div>
+                    <span className={`agenda-category agenda-category-${event.category.toLowerCase().replace(/[^a-z]+/g, "-")}`}>{event.category}</span>
+                    {event.notes && <p>{event.notes}</p>}
+                  </div>
+                  <div className="agenda-event-actions">
+                    <button className="text-button" type="button" onClick={() => onEdit(event)}>Modifier</button>
+                    <button className="icon-btn danger" type="button" aria-label={`Supprimer ${event.title}`} onClick={() => onDelete(event.id)}><Trash2 size={16} /></button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+          <form className="agenda-form" onSubmit={submitEvent}>
+            <div className="panel-heading agenda-form-heading">
+              <div><h2>{editingId ? "Modifier l’événement" : "Ajouter un événement"}</h2><p className="muted">Il restera dans ton agenda sur cet appareil.</p></div>
+            </div>
+            <label>
+              Titre
+              <input value={form.title} onChange={(e) => onFormChange({ ...form, title: e.target.value })} placeholder="Ex. : Révision Python" maxLength={100} required />
+            </label>
+            <div className="agenda-form-row">
+              <label>
+                Date
+                <input type="date" value={form.date || selectedDate} onChange={(e) => onFormChange({ ...form, date: e.target.value })} required />
+              </label>
+              <label>
+                Heure
+                <input type="time" value={form.time || "09:00"} onChange={(e) => onFormChange({ ...form, time: e.target.value })} required />
+              </label>
+            </div>
+            <label>
+              Catégorie
+              <select value={form.category || "Personnel"} onChange={(e) => onFormChange({ ...form, category: e.target.value })}>
+                {AGENDA_CATEGORIES.map((category) => <option key={category}>{category}</option>)}
+              </select>
+            </label>
+            <label>
+              Notes (facultatif)
+              <textarea value={form.notes || ""} onChange={(e) => onFormChange({ ...form, notes: e.target.value })} placeholder="Détails ou préparation à prévoir…" maxLength={500} />
+            </label>
+            <div className="form-actions">
+              {editingId && <button className="secondary" type="button" onClick={onCancelEdit}>Annuler</button>}
+              <button className="primary" type="submit">{editingId ? "Enregistrer" : "Ajouter à l’agenda"}</button>
+            </div>
+            {message && <p className="notice" role="status">{message}</p>}
+          </form>
+        </section>
+      </div>
+    </>
   );
 }
 function Stat({ icon: Icon, label, value, sub }) {
